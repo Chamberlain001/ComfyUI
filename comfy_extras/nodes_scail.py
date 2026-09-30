@@ -27,22 +27,17 @@ DEFAULT_PALETTE = [
 ]
 
 
-def _unpack(track_data):
-    packed = track_data["packed_masks"]
-    if packed is None or packed.shape[1] == 0:
-        return None
-    return unpack_masks(packed)
+MASK_FRAME_CHUNK = 16  # unpacked masks of long videos don't fit in memory all at once
 
 
-def _first_appearance_cx_area(masks_bool):
+def _first_appearance_cx_area(packed):
     """Per object: first frame it appears in, plus centroid-x and area in that frame."""
-    m = masks_bool.float()
-    T, H, W = m.shape[0], m.shape[-2], m.shape[-1]
-    grid_x = torch.arange(W, device=m.device, dtype=m.dtype).view(1, 1, 1, W)
-    area_t = m.sum(dim=(-1, -2))
-    cx_t = (m * grid_x).sum(dim=(-1, -2)) / area_t.clamp(min=1)
+    col_t = torch.cat([unpack_masks(c).sum(dim=-2) for c in packed.split(MASK_FRAME_CHUNK)])
+    T, H, W = col_t.shape[0], packed.shape[-2], col_t.shape[-1]
+    area_t = col_t.sum(dim=-1)
+    cx_t = (col_t * torch.arange(W, device=col_t.device)).sum(dim=-1) / area_t.clamp(min=1)
     present = area_t > 0
-    frame_idx = torch.arange(T, device=m.device).unsqueeze(1)
+    frame_idx = torch.arange(T, device=col_t.device).unsqueeze(1)
     first_t = torch.where(present, frame_idx, T).amin(dim=0)
     sel = first_t.clamp(max=T - 1).unsqueeze(0)
     cx = cx_t.gather(0, sel).squeeze(0)
@@ -81,15 +76,18 @@ def _render_colored_masks(track_data, background="black"):
         [DEFAULT_PALETTE[i % len(DEFAULT_PALETTE)] for i in range(N_obj)],
         device=device, dtype=dtype,
     )
-    masks_full = unpack_masks(packed.to(device)).float()
-    Hm, Wm = masks_full.shape[-2], masks_full.shape[-1]
-    masks_full = F.interpolate(
-        masks_full.view(T * N_obj, 1, Hm, Wm), size=(H, W), mode="nearest"
-    ).view(T, N_obj, H, W) > 0.5
-    any_mask = masks_full.any(dim=1)
-    color_overlay = colors[masks_full.to(torch.uint8).argmax(dim=1)]
-    bg_tensor = torch.tensor(bg_rgb, device=device, dtype=color_overlay.dtype).view(1, 1, 1, 3)
-    return torch.where(any_mask.unsqueeze(-1), color_overlay, bg_tensor.expand_as(color_overlay))
+    bg_tensor = torch.tensor(bg_rgb, device=device, dtype=dtype).view(1, 1, 1, 3)
+    out = torch.empty(T, H, W, 3, device=device, dtype=dtype)
+    for i in range(0, T, MASK_FRAME_CHUNK):
+        masks_full = unpack_masks(packed[i:i + MASK_FRAME_CHUNK].to(device)).float()
+        t, Hm, Wm = masks_full.shape[0], masks_full.shape[-2], masks_full.shape[-1]
+        masks_full = F.interpolate(
+            masks_full.view(t * N_obj, 1, Hm, Wm), size=(H, W), mode="nearest"
+        ).view(t, N_obj, H, W) > 0.5
+        any_mask = masks_full.any(dim=1)
+        color_overlay = colors[masks_full.to(torch.uint8).argmax(dim=1)]
+        out[i:i + t] = torch.where(any_mask.unsqueeze(-1), color_overlay, bg_tensor.expand_as(color_overlay))
+    return out
 
 
 def _render_mask_as_identity(mask, background="black"):
@@ -304,9 +302,9 @@ class SCAIL2ColoredMask(io.ComfyNode):
     @classmethod
     def execute(cls, driving_track_data, object_indices, sort_by, replacement_mode, ref_track_data=None):
         def _prep(td):
-            masks_bool = _unpack(td)
-            if sort_by != "none" and masks_bool is not None:
-                first_t, cx, area = _first_appearance_cx_area(masks_bool)
+            packed = td["packed_masks"]
+            if sort_by != "none" and packed is not None and packed.shape[1] > 0:
+                first_t, cx, area = _first_appearance_cx_area(packed)
                 if sort_by == "left_to_right":
                     order = sorted(range(len(cx)), key=lambda i: (first_t[i], cx[i]))
                 else:  # "area"
